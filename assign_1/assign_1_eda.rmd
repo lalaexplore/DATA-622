@@ -1,0 +1,140 @@
+---
+title: 'Assignment 1: Exploratory Data Analysis'
+author: "Sandra Dela Cruz"
+date: "2025-09-16"
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r, include=FALSE}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+library(purrr)
+library(DataExplorer)
+library(lares)
+library(reshape2)
+library(readr)
+library(mice)
+library(caret)
+library(ROSE)
+```
+
+```{r, include=FALSE}
+# Import dataset
+bank_data_raw = read_delim('https://raw.githubusercontent.com/lalaexplore/DATA-622/refs/heads/main/assign_1/bank-full.csv', delim = ";")
+```
+
+# **Data Exploration**
+```{r, echo=FALSE}
+glimpse(bank_data_raw)
+summary(bank_data_raw)
+
+# Convert all factor variables and -1 pdays to 0 for not previously contacted
+bank_data_raw = bank_data_raw |>
+  mutate(
+    pdays = ifelse(pdays == -1, 0, pdays),
+    across(c(job, marital, education, default, housing, loan,
+             contact, day, month, poutcome, y), as.factor),
+    across(c(campaign, pdays, previous), as.ordered)
+  )
+
+glimpse(bank_data_raw)
+summary(bank_data_raw)
+plot_missing(bank_data_raw) # plot missing data
+```
+
+```{r, echo=FALSE}
+#| fig-height: 5
+#| fig-width: 10
+plot_histogram(bank_data_raw)
+plot_qq(bank_data_raw, by='y')
+plot_bar(bank_data_raw)
+
+# Create Visual Correlation
+corr_cross(bank_data_raw,
+           method = "spearman", max_pvalue = 0.5, top = 20)
+
+corr_cross(bank_data_raw,
+           method = "spearman", max_pvalue = 0.5,
+           contains = "y")
+```
+# **Preprocessing Considerations**
+```{r, echo=FALSE}
+#| fig-height: 5
+#| fig-width: 10
+# Spilt data
+set.seed(622)
+trainIndex = createDataPartition(bank_data_raw$y, p=0.7, list=FALSE)
+bd_train = bank_data_raw[trainIndex, ]
+bd_test = bank_data_raw[-trainIndex, ]
+
+# Rebalance data, oversampling of target variable "yes"
+bd_train = ovun.sample(y ~ .,
+                       data = bd_train,
+                       method = "over",
+                       seed = 622)$data
+
+# Overview of training data
+table(bd_train$y) # no=27946   yes=27828
+summary(bd_train)
+plot_histogram(bd_train)
+plot_qq(bd_train, by='y')
+plot_boxplot(bd_train, by='y')
+plot_bar(bd_train)
+```
+
+```{r, echo=FALSE}
+# Feature Engineering
+
+# Add column of age group and balance group
+# Step 1: Define balance breaks points
+bbreaks_100 = seq(0, 900, by=100) # 0 to 900 in 100s
+bbreaks_1000 = seq(1000, 5000, by=1000) # 1000 to 5000 in 1000s
+
+# Combine all breaks
+balance_breaks = c(-Inf, bbreaks_100, bbreaks_1000, Inf)
+
+# Step 2: Auto-generate labels
+balance_labels = c("Negative",
+                   paste0(bbreaks_100, "-", bbreaks_100 + 99),
+                   paste0(bbreaks_1000[-length(bbreaks_1000)], "-", 
+                          bbreaks_1000[-1] - 1),
+                   "5000+")
+
+# Step 3: Apply
+feature_engineer <- function(df) {
+  df |>
+    mutate(
+      duration_min = duration / 60,
+      age_group = cut(
+        age,
+        breaks = c(18, 30, 40, 50, 60, 70, 100),
+        labels = c("18-29", "30-39", "40-49", "50-59", "60-69", "70+"),
+        include.lowest = TRUE
+      ),
+      balance_group = cut(
+        balance,
+        breaks = balance_breaks,
+        labels = balance_labels,
+        include.lowest = TRUE
+      ),
+      indebt = factor(
+        ifelse(balance < 0, 1, 0),
+        levels = c(0, 1),
+        labels = c("Not in Debt", "In Debt")
+      )
+    )
+}
+
+bd_train = feature_engineer(bd_train)
+bd_test = feature_engineer(bd_test)
+
+summary(bd_train)
+plot_histogram(bd_train)
+plot_qq(bd_train, by='y')
+plot_boxplot(bd_train, by='y')
+plot_bar(bd_train)
+```
+

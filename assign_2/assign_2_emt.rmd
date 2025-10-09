@@ -1,0 +1,842 @@
+---
+title: 'Assignment 2: Experimentation and Model Training'
+author: "Sandra Dela Cruz"
+date: "2025-10-04"
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r, include=FALSE}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+library(purrr)
+library(DataExplorer)
+library(lares)
+library(reshape2)
+library(readr)
+library(mice)
+library(caret)
+library(ROSE)
+library(mlr3)
+library(mlr3learners)
+library(mlr3tuning)
+library(mlr3verse)
+library(paradox)
+library(pROC)
+library(rpart.plot)
+library(ranger)
+library(xgboost)
+library(data.table)
+```
+
+```{r, include=FALSE}
+# Import dataset
+bank_data_raw = read_delim('https://raw.githubusercontent.com/lalaexplore/DATA-622/refs/heads/main/assign_1/bank-full.csv', delim = ";")
+```
+
+# **Data Exploration**
+```{r, echo=FALSE}
+glimpse(bank_data_raw)
+summary(bank_data_raw)
+
+# Convert all factor variables and -1 pdays to 0 for not previously contacted
+bank_data_raw = bank_data_raw |>
+  mutate(
+    pdays = ifelse(pdays == -1, 0, pdays),
+    across(c(job, marital, education, default, housing, loan,
+             contact, day, month, poutcome, y), as.factor),
+    across(c(campaign, pdays, previous), as.ordered)
+  )
+
+glimpse(bank_data_raw)
+summary(bank_data_raw)
+plot_missing(bank_data_raw) # plot missing data
+```
+
+```{r, echo=FALSE}
+#| fig-height: 5
+#| fig-width: 10
+plot_histogram(bank_data_raw)
+plot_qq(bank_data_raw, by='y')
+plot_bar(bank_data_raw)
+
+# Create Visual Correlation
+corr_cross(bank_data_raw,
+           method = "spearman", max_pvalue = 0.5, top = 20)
+
+corr_cross(bank_data_raw,
+           method = "spearman", max_pvalue = 0.5,
+           contains = "y")
+```
+# **Preprocessing Considerations**
+```{r, echo=FALSE}
+#| fig-height: 5
+#| fig-width: 10
+# Spilt data
+set.seed(622)
+trainIndex = createDataPartition(bank_data_raw$y, p=0.7, list=FALSE)
+bd_train = bank_data_raw[trainIndex, ]
+bd_test = bank_data_raw[-trainIndex, ]
+
+# Rebalance data, oversampling of target variable "yes"
+bd_train = ovun.sample(y ~ .,
+                       data = bd_train,
+                       method = "over",
+                       seed = 622)$data
+
+# Overview of training data
+table(bd_train$y) # no=27946   yes=27828
+summary(bd_train)
+plot_histogram(bd_train)
+plot_qq(bd_train, by='y')
+plot_boxplot(bd_train, by='y')
+plot_bar(bd_train)
+```
+# **Feature Engineering**
+```{r, echo=FALSE}
+# Feature Engineering
+
+# Add column of age group and balance group
+# Step 1: Define balance breaks points
+bbreaks_100 = seq(0, 900, by=100) # 0 to 900 in 100s
+bbreaks_1000 = seq(1000, 5000, by=1000) # 1000 to 5000 in 1000s
+
+# Combine all breaks
+balance_breaks = c(-Inf, bbreaks_100, bbreaks_1000, Inf)
+
+# Step 2: Auto-generate labels
+balance_labels = c("Negative",
+                   paste0(bbreaks_100, "-", bbreaks_100 + 99),
+                   paste0(bbreaks_1000[-length(bbreaks_1000)], "-", 
+                          bbreaks_1000[-1] - 1),
+                   "5000+")
+
+# Step 3: Apply
+feature_engineer = function(df) {
+  df |>
+    mutate(
+      duration_min = duration / 60,
+      age_group = cut(
+        age,
+        breaks = c(18, 30, 40, 50, 60, 70, 100),
+        labels = c("18-29", "30-39", "40-49", "50-59", "60-69", "70+"),
+        include.lowest = TRUE
+      ),
+      balance_group = cut(
+        balance,
+        breaks = balance_breaks,
+        labels = balance_labels,
+        include.lowest = TRUE
+      ),
+      indebt = factor(
+        ifelse(balance < 0, 1, 0),
+        levels = c(0, 1),
+        labels = c("Not in Debt", "In Debt")
+      )
+    )
+}
+
+bd_train = feature_engineer(bd_train)
+bd_test = feature_engineer(bd_test)
+
+summary(bd_train)
+plot_histogram(bd_train)
+plot_qq(bd_train, by='y')
+plot_boxplot(bd_train, by='y')
+plot_bar(bd_train)
+```
+# **Experimentation and Model Training**
+```{r Decision Tree 1, echo=FALSE}
+# Selected variable sets
+sv1 = c("age", "job", "balance", "month", "duration", "contact", "campaign", "y")
+sv2 = c("age_group", "balance_group","duration_min", "contact", "y")
+sv3 = c("marital", "education", "default", "month", "pdays", "y")
+
+# Create dataframe for the selected sets for model experimentation
+bd_train_sv1 = bd_train[, sv1]
+bd_train_sv2 = bd_train[, sv2]
+bd_train_sv3 = bd_train[, sv3]
+
+# Decision Tree #1 
+# Create task
+task1 = TaskClassif$new(
+  id = "dt1",
+  backend = bd_train_sv1,
+  target = "y"
+)
+
+# Define learner
+learner_tree1 = lrn("classif.rpart", predict_type = "prob")
+
+# Define hyperparameter search space
+search_space_tree1 = ps(
+  cp = p_dbl(lower = 0.001, upper = 0.1),
+  minsplit = p_int(lower = 2, upper = 20),
+  maxdepth = p_int(lower = 3, upper = 10)
+)
+
+# Set resampling method
+resampling = rsmp("repeated_cv", folds = 5)
+
+# Tuning Instance
+instance_tree1 = TuningInstanceSingleCrit$new(
+  task = task1,
+  learner = learner_tree1,
+  resampling = resampling,
+  measure = msr("classif.auc"),
+  search_space = search_space_tree1,
+  terminator = trm("evals", n_evals = 100)
+)
+
+# Create tuner
+tuner = tnr("random_search")
+
+# Optimize
+tuner$optimize(instance_tree1)
+  
+# Train final model with best params
+learner_tree1$predict_type = "prob"
+learner_tree1$param_set$values = instance_tree1$results_learner_param_vals
+learner_tree1$train(task1)
+
+# After training
+importance1 = learner_tree1$model$variable.importance
+print(importance1)
+
+# Visualize the trained decision tree
+rpart.plot(learner_tree1$model, type = 2, extra = 104, fallen.leaves = TRUE, main = "Decision Tree 1")
+
+
+# Test with bd_test (unseen data)
+
+# Select the same features from bd_test as used in training
+bd_test_sv1 = bd_test[, sv1]
+
+# Create task for test data with those features
+task_test1 = TaskClassif$new(id = "test_task", backend = bd_test_sv1, target = "y")
+
+# Predict on test task
+prediction1 = learner_tree1$predict(task_test1)
+
+# Evaluate performance on test data
+print(prediction1$confusion)
+
+# Evaluate multiple performance metrics
+measures = list(
+  msr("classif.acc"),
+  msr("classif.precision"),
+  msr("classif.recall"),
+  msr("classif.fbeta", beta = 1),
+  msr("classif.auc") # For binary classification only
+)
+
+prediction1$score(measures)
+
+# ROC curve for plotting
+# Get probability predictions for "positive" class
+roc_data_dt1 = data.frame(
+  truth = prediction1$truth,
+  prob = prediction1$prob[, "yes"],  # or use prediction1$prob("yes") if using latest mlr3 version
+  model = "Decision Tree 1"
+)
+
+# all_roc_data = bind_rows(roc_data_dt1, roc_data_rf, roc_data_ada) You can repeat this for other models (e.g., random forest, adaboost), then combine them
+
+# Plot ROC
+roc_obj1 = roc(roc_data_dt1$truth, roc_data_dt1$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj1, col = "blue", main = "ROC Curve - Decision Tree 1")
+```
+
+```{r Decision Tree 2, echo=FALSE}
+# Decision Tree #2
+# Create task
+task2 = TaskClassif$new(
+  id = "dt2",
+  backend = bd_train_sv2,
+  target = "y"
+)
+
+# Define learner
+learner_tree2 = lrn("classif.rpart", predict_type = "prob")
+
+# Define hyperparameter search space
+search_space_tree2 = ps(
+  cp = p_dbl(lower = 0.001, upper = 0.1),
+  minsplit = p_int(lower = 2, upper = 20),
+  maxdepth = p_int(lower = 3, upper = 10)
+)
+
+# Set resampling method
+resampling = rsmp("repeated_cv", folds = 5)
+
+# Tuning Instance
+instance_tree2 = TuningInstanceSingleCrit$new(
+  task = task2,
+  learner = learner_tree2,
+  resampling = resampling,
+  measure = msr("classif.auc"),
+  search_space = search_space_tree2,
+  terminator = trm("evals", n_evals = 100)
+)
+
+# Run tuner
+tuner$optimize(instance_tree2)
+  
+# Train final model with best params
+learner_tree2$predict_type = "prob"
+learner_tree2$param_set$values = instance_tree2$results_learner_param_vals
+learner_tree2$train(task2)
+
+# After training
+importance2 = learner_tree2$model$variable.importance
+print(importance2)
+
+# Visualize the trained decision tree
+rpart.plot(learner_tree2$model, type = 2, extra = 104, fallen.leaves = TRUE, main = "Decision Tree 2")
+
+
+# Test with bd_test (unseen data)
+
+# Select the same features from bd_test as used in training
+bd_test_sv2 = bd_test[, sv2]
+
+# Create task for test data with those features
+task_test2 = TaskClassif$new(id = "test_task", backend = bd_test_sv2, target = "y")
+
+# Predict on test task
+prediction2 = learner_tree2$predict(task_test2)
+
+# Evaluate performance on test data
+print(prediction2$confusion)
+
+# Evaluate multiple performance metrics
+measures = list(
+  msr("classif.acc"),
+  msr("classif.precision"),
+  msr("classif.recall"),
+  msr("classif.fbeta", beta = 1),
+  msr("classif.auc") # For binary classification only
+)
+
+prediction2$score(measures)
+
+# ROC curve for plotting
+# Get probability predictions for "positive" class
+roc_data_dt2 = data.frame(
+  truth = prediction2$truth,
+  prob = prediction2$prob[, "yes"],  # or use prediction1$prob("yes") if using latest mlr3 version
+  model = "Decision Tree 2"
+)
+
+# all_roc_data = bind_rows(roc_data_dt1, roc_data_rf, roc_data_ada) You can repeat this for other models (e.g., random forest, adaboost), then combine them
+
+# Plot ROC
+roc_obj2 = roc(roc_data_dt2$truth, roc_data_dt2$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj2, col = "blue", main = "ROC Curve - Decision Tree 2")
+```
+
+```{r Decision Tree 3, echo=FALSE}
+# Decision Tree #3
+# Create task
+task3 = TaskClassif$new(
+  id = "dt3",
+  backend = bd_train_sv3,
+  target = "y"
+)
+
+# Define learner
+learner_tree3 = lrn("classif.rpart", predict_type = "prob")
+
+# Define hyperparameter search space
+search_space_tree3 = ps(
+  cp = p_dbl(lower = 0.001, upper = 0.1),
+  minsplit = p_int(lower = 2, upper = 20),
+  maxdepth = p_int(lower = 3, upper = 10)
+)
+
+# Set resampling method
+resampling = rsmp("repeated_cv", folds = 5)
+
+# Tuning Instance
+instance_tree3 = TuningInstanceSingleCrit$new(
+  task = task3,
+  learner = learner_tree3,
+  resampling = resampling,
+  measure = msr("classif.auc"),
+  search_space = search_space_tree3,
+  terminator = trm("evals", n_evals = 100)
+)
+
+# Run tuner
+tuner$optimize(instance_tree3)
+  
+# Train final model with best params
+learner_tree3$predict_type = "prob"
+learner_tree3$param_set$values = instance_tree3$results_learner_param_vals
+learner_tree3$train(task3)
+
+# After training
+importance3 = learner_tree3$model$variable.importance
+print(importance3)
+
+# Visualize the trained decision tree
+rpart.plot(learner_tree3$model, type = 2, extra = 104, fallen.leaves = TRUE, main = "Decision Tree 3")
+
+
+# Test with bd_test (unseen data)
+
+# Select the same features from bd_test as used in training
+bd_test_sv3 = bd_test[, sv3]
+
+# Create task for test data with those features
+task_test3 = TaskClassif$new(id = "test_task", backend = bd_test_sv3, target = "y")
+
+# Predict on test task
+prediction3 = learner_tree3$predict(task_test3)
+
+# Evaluate performance on test data
+print(prediction3$confusion)
+
+# Evaluate multiple performance metrics
+measures = list(
+  msr("classif.acc"),
+  msr("classif.precision"),
+  msr("classif.recall"),
+  msr("classif.fbeta", beta = 1),
+  msr("classif.auc") # For binary classification only
+)
+
+prediction3$score(measures)
+
+# ROC curve for plotting
+# Get probability predictions for "positive" class
+roc_data_dt3 = data.frame(
+  truth = prediction3$truth,
+  prob = prediction3$prob[, "yes"],  # or use prediction1$prob("yes") if using latest mlr3 version
+  model = "Decision Tree 3"
+)
+
+# all_roc_data = bind_rows(roc_data_dt1, roc_data_rf, roc_data_ada) You can repeat this for other models (e.g., random forest, adaboost), then combine them
+
+# Plot ROC
+roc_obj3 = roc(roc_data_dt3$truth, roc_data_dt3$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj3, col = "blue", main = "ROC Curve - Decision Tree 3")
+```
+
+```{r Random Forest 1, echo=FALSE}
+# Create classification task
+task_rf1 = TaskClassif$new(
+  id = "rf1",
+  backend = bd_train_sv1,
+  target = "y"
+)
+
+# Define learner
+learner_rf1 = lrn("classif.ranger", 
+                  num.trees = 50, 
+                  predict_type = "prob",
+                  importance = "impurity",
+                  write.forest = TRUE) # needed to extract trees
+
+# Define hyperparameter search space
+search_space_rf1 = ps(
+  mtry = p_int (lower = 2, upper = 6),
+  min.node.size = p_int(lower = 1, upper = 10)
+)
+
+# Tuning instance
+instance_rf1 = TuningInstanceSingleCrit$new(
+  task = task_rf1,
+  learner = learner_rf1,
+  resampling = resampling,
+  measure = msr ("classif.auc"),
+  search_space = search_space_rf1,
+  terminator = trm ("evals", n_evals = 20)
+)
+
+# Run tuning
+tuner$optimize(instance_rf1)
+
+# Train final model with best hyperparameters
+learner_rf1$param_set$values = instance_rf1$result_learner_param_vals
+learner_rf1$train(task_rf1)
+
+# Variable importance
+importance_rf1 = learner_rf1$model$variable.importance
+print(importance_rf1)
+
+# --- Train a separate decision tree just for visualization (not used for prediction)
+rf1_model = rpart(y ~., data = as.data.frame(bd_train_sv1),
+                  method = "class")
+
+# Plot the decision tree for interpretability
+rpart.plot(rf1_model, type = 4, extra = 104, 
+           main = "Example Decision Tree 4 (for interpretation only)")
+printcp(rf1_model)
+
+
+# Test on unseen test set
+
+# Subset test set with the same features
+bd_test_sv1 = bd_test[, sv1]
+
+# Create task for test set
+task_test_rf1 = TaskClassif$new(
+  id = "test_rf1",
+  backend = bd_test_sv1,
+  target = "y"
+)
+
+# Predict on test set
+prediction_rf1 = learner_rf1$predict(task_test_rf1)
+
+# Confusion matrix
+print(prediction_rf1$confusion)
+
+# Evaluate multiple metrics
+prediction_rf1$score(measures)
+
+# Get probability for positive class "yes"
+roc_data_rf1 = data.frame(
+  truth = prediction_rf1$truth,
+  prob = prediction_rf1$prob[, "yes"],
+  model = "Random Forest 1"
+)
+
+# Plot ROC
+roc_obj_rf1 = roc(roc_data_rf1$truth, roc_data_rf1$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj_rf1, col = "forestgreen", main = "ROC Curve - Random Forest 1")
+```
+
+```{r Random Forest 2, echo=FALSE}
+# Create classification task
+task_rf2 = TaskClassif$new(
+  id = "rf2",
+  backend = bd_train_sv2,
+  target = "y"
+)
+
+# Define learner
+learner_rf2 = lrn("classif.ranger", 
+                  num.trees = 50, 
+                  predict_type = "prob",
+                  importance = "impurity",
+                  write.forest = TRUE) # needed to extract trees
+
+# Define hyperparameter search space
+search_space_rf2 = ps(
+  mtry = p_int (lower = 2, upper = 3 ), # upper changed
+  min.node.size = p_int(lower = 1, upper = 10)
+)
+
+# Tuning instance
+instance_rf2 = TuningInstanceSingleCrit$new(
+  task = task_rf2,
+  learner = learner_rf2,
+  resampling = resampling,
+  measure = msr ("classif.auc"),
+  search_space = search_space_rf2,
+  terminator = trm ("evals", n_evals = 20)
+)
+
+# Run tuning
+tuner$optimize(instance_rf2)
+
+# Train final model with best hyperparameters
+learner_rf2$param_set$values = instance_rf2$result_learner_param_vals
+learner_rf2$train(task_rf2)
+
+# Variable importance
+importance_rf2 = learner_rf2$model$variable.importance
+print(importance_rf2)
+
+# --- Train a separate decision tree just for visualization (not used for prediction)
+rf2_model = rpart(y ~., data = as.data.frame(bd_train_sv2),
+                  method = "class")
+
+# Plot the decision tree for interpretability
+rpart.plot(rf2_model, type = 4, extra = 104, 
+           main = "Example Decision Tree 5 (for interpretation only)")
+printcp(rf2_model)
+
+
+# Test on unseen test set
+
+# Subset test set with the same features
+bd_test_sv2 = bd_test[, sv2]
+
+# Create task for test set
+task_test_rf2 = TaskClassif$new(
+  id = "test_rf2",
+  backend = bd_test_sv2,
+  target = "y"
+)
+
+# Predict on test set
+prediction_rf2 = learner_rf2$predict(task_test_rf2)
+
+# Confusion matrix
+print(prediction_rf2$confusion)
+
+# Evaluate multiple metrics
+prediction_rf2$score(measures)
+
+# Get probability for positive class "yes"
+roc_data_rf2 = data.frame(
+  truth = prediction_rf2$truth,
+  prob = prediction_rf2$prob[, "yes"],
+  model = "Random Forest 2"
+)
+
+# Plot ROC
+roc_obj_rf2 = roc(roc_data_rf2$truth, roc_data_rf2$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj_rf2, col = "forestgreen", main = "ROC Curve - Random Forest 2")
+```
+
+```{r Random Forest 3, echo=FALSE}
+# Create classification task
+task_rf3 = TaskClassif$new(
+  id = "rf3",
+  backend = bd_train_sv3,
+  target = "y"
+)
+
+# Define learner
+learner_rf3 = lrn("classif.ranger", 
+                  num.trees = 50, 
+                  predict_type = "prob",
+                  importance = "impurity",
+                  write.forest = TRUE) # needed to extract trees
+
+# Define hyperparameter search space
+search_space_rf3 = ps(
+  mtry = p_int (lower = 2, upper = 4), # upper changed
+  min.node.size = p_int(lower = 1, upper = 10)
+)
+
+# Tuning instance
+instance_rf3 = TuningInstanceSingleCrit$new(
+  task = task_rf3,
+  learner = learner_rf3,
+  resampling = resampling,
+  measure = msr ("classif.auc"),
+  search_space = search_space_rf3,
+  terminator = trm ("evals", n_evals = 20)
+)
+
+# Run tuning
+tuner$optimize(instance_rf3)
+
+# Train final model with best hyperparameters
+learner_rf3$param_set$values = instance_rf3$result_learner_param_vals
+learner_rf3$train(task_rf3)
+
+# Variable importance
+importance_rf3 = learner_rf3$model$variable.importance
+print(importance_rf3)
+
+# --- Train a separate decision tree just for visualization (not used for prediction)
+rf3_model = rpart(y ~., data = as.data.frame(bd_train_sv3),
+                  method = "class")
+
+# Plot the decision tree for interpretability
+rpart.plot(rf3_model, type = 4, extra = 104, 
+           main = "Example Decision Tree 6 (for interpretation only)")
+printcp(rf3_model)
+
+
+# Test on unseen test set
+
+# Subset test set with the same features
+bd_test_sv3 = bd_test[, sv3]
+
+# Create task for test set
+task_test_rf3 = TaskClassif$new(
+  id = "test_rf3",
+  backend = bd_test_sv3,
+  target = "y"
+)
+
+# Predict on test set
+prediction_rf3 = learner_rf3$predict(task_test_rf3)
+
+# Confusion matrix
+print(prediction_rf3$confusion)
+
+# Evaluate multiple metrics
+prediction_rf3$score(measures)
+
+# Get probability for positive class "yes"
+roc_data_rf3 = data.frame(
+  truth = prediction_rf3$truth,
+  prob = prediction_rf3$prob[, "yes"],
+  model = "Random Forest 3"
+)
+
+# Plot ROC
+roc_obj_rf3 = roc(roc_data_rf3$truth, roc_data_rf3$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj_rf3, col = "forestgreen", main = "ROC Curve - Random Forest 3")
+```
+
+```{r AdaBoost 1, echo=FALSE}
+# Prepare bd_train_sv1
+bd_train_sv1$y = as.factor(bd_train_sv1$y)
+X1 = bd_train_sv1[, setdiff(names(bd_train_sv1), "y")]
+y1 = bd_train_sv1$y
+X1_encoded = model.matrix(~ . - 1, data = X1)
+bd_train_encoded1 = data.frame(X1_encoded, y = y1)
+
+task_boost1 = TaskClassif$new(id = "ada_xgb_sv1", backend = bd_train_encoded1, target = "y", positive = "yes")
+
+learner1 = lrn("classif.xgboost", predict_type = "prob")
+
+search_space1 = ps(
+  nrounds = p_int(lower = 20, upper = 60),
+  max_depth = p_int(lower = 1, upper = 2),
+  eta = p_dbl(lower = 0.5, upper = 1.0)
+)
+
+resampling1 = rsmp("cv", folds = 3)
+
+instance1 = TuningInstanceSingleCrit$new(
+  task = task_boost1,
+  learner = learner1,
+  resampling = resampling1,
+  measure = msr("classif.auc"),
+  search_space = search_space1,
+  terminator = trm("evals", n_evals = 20)
+)
+
+tuner1 = tnr("random_search")
+tuner1$optimize(instance1)
+
+learner1$param_set$values = instance1$result_learner_param_vals
+learner1$train(task_boost1)
+
+booster1 = learner1$model
+importance_matrix1 = xgb.importance(model = booster1)
+print(importance_matrix1)
+xgb.plot.importance(importance_matrix1, top_n = 10, main = "AdaBoost-style XGBoost 1 Variable Importance")
+
+# Test prediction for sv1
+bd_test_sv1$y = as.factor(bd_test_sv1$y)
+X_test1 = bd_test_sv1[, setdiff(names(bd_test_sv1), "y")]
+y_test1 = bd_test_sv1$y
+X_test_encoded1 = model.matrix(~ . - 1, data = X_test1)
+bd_test_encoded1 = data.frame(X_test_encoded1, y = y_test1)
+task_test1 = TaskClassif$new(id = "test_ada_xgb_sv1", backend = bd_test_encoded1, target = "y", positive = "yes")
+prediction_ada1 = learner1$predict(task_test1)
+
+print(prediction_ada1$confusion)
+print(prediction_ada1$score(measures))
+
+roc_data1 = data.frame(truth = prediction_ada1$truth, prob = prediction_ada1$prob[, "yes"])
+roc_obj1 = roc(roc_data1$truth, roc_data1$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj1, col = "red", main = "ROC Curve - AdaBoost-style XGBoost 1")
+```
+
+```{r AdaBoost 2, echo=FALSE}
+# Prepare bd_train_sv2
+bd_train_sv2$y = as.factor(bd_train_sv2$y)
+X2 = bd_train_sv2[, setdiff(names(bd_train_sv2), "y")]
+y2 = bd_train_sv2$y
+X2_encoded = model.matrix(~ . - 1, data = X2)
+bd_train_encoded2 = data.frame(X2_encoded, y = y2)
+
+task_boost2 = TaskClassif$new(id = "ada_xgb_sv2", backend = bd_train_encoded2, target = "y", positive = "yes")
+
+learner2 = lrn("classif.xgboost", predict_type = "prob")
+
+search_space2 = ps(
+  nrounds = p_int(lower = 20, upper = 60),
+  max_depth = p_int(lower = 1, upper = 2),
+  eta = p_dbl(lower = 0.5, upper = 1.0)
+)
+
+resampling2 = rsmp("cv", folds = 3)
+
+instance2 = TuningInstanceSingleCrit$new(
+  task = task_boost2,
+  learner = learner2,
+  resampling = resampling2,
+  measure = msr("classif.auc"),
+  search_space = search_space2,
+  terminator = trm("evals", n_evals = 20)
+)
+
+tuner2 = tnr("random_search")
+tuner2$optimize(instance2)
+
+learner2$param_set$values = instance2$result_learner_param_vals
+learner2$train(task_boost2)
+
+booster2 = learner2$model
+importance_matrix2 = xgb.importance(model = booster2)
+print(importance_matrix2)
+xgb.plot.importance(importance_matrix2, top_n = 10, main = "AdaBoost-style XGBoost 2 Variable Importance")
+
+# Test prediction for sv2
+bd_test_sv2$y = as.factor(bd_test_sv2$y)
+X_test2 = bd_test_sv2[, setdiff(names(bd_test_sv2), "y")]
+y_test2 = bd_test_sv2$y
+X_test_encoded2 = model.matrix(~ . - 1, data = X_test2)
+bd_test_encoded2 = data.frame(X_test_encoded2, y = y_test2)
+task_test2 = TaskClassif$new(id = "test_ada_xgb_sv2", backend = bd_test_encoded2, target = "y", positive = "yes")
+prediction_ada2 = learner2$predict(task_test2)
+
+print(prediction_ada2$confusion)
+print(prediction_ada2$score(measures))
+
+roc_data2 = data.frame(truth = prediction_ada2$truth, prob = prediction_ada2$prob[, "yes"])
+roc_obj2 = roc(roc_data2$truth, roc_data2$prob, levels = c("no", "yes"), direction = "<")
+plot(roc_obj2, col = "red", main = "ROC Curve - AdaBoost-style XGBoost 2")
+```
+
+```{r, echo=FALSE}
+# Named list of prediction objects
+predictions = list(
+  DT1 = prediction1,
+  DT2 = prediction2,
+  DT3 = prediction3,
+  RF1 = prediction_rf1,
+  RF2 = prediction_rf2,
+  RF3 = prediction_rf3,
+  ADA1 = prediction_ada1,
+  ADA2 = prediction_ada2
+)
+
+# Score each model and build a data frame with proper column names
+results_list <- lapply(names(predictions), function(name) {
+  scores <- predictions[[name]]$score(measures)
+  # scores is a named numeric vector; convert to data frame with correct names
+  df <- as.data.frame(as.list(scores))
+  df$model <- name
+  df
+})
+
+# Combine all rows
+results_wide <- bind_rows(results_list)
+
+# Reorder columns (optional)
+results_wide <- results_wide %>%
+  select(model, everything())
+
+# Round for readability
+results_wide <- results_wide %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+# Check result
+print(results_wide)
+
+# Rename columns for report use
+results_wide %>%
+  rename(
+    Accuracy = classif.acc,
+    Precision = classif.precision,
+    Recall = classif.recall,
+    F1_Score = classif.fbeta,
+    AUC = classif.auc
+  )
+```
